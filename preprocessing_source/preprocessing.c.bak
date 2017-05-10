@@ -1,0 +1,1240 @@
+/*	
+*	program name : strace viewer
+*	what is it? pre-process the strace's result to make the graphs.
+*	 
+*	history : 2017. 04. 26 - create data structure
+		  2017. 04. 27 - create pre-processing function
+		  2017. 04. 28 - create reading type of input file
+		  2017. 05. 01 - create open process in pre-processing function
+		  2017. 05. 02 - create close process in pre-processing function
+		  2017. 05. 03 - create read and write process in pre-processing function
+		  			   - describe functions
+		  2017. 05. 04 - create output file function (output_syscall(), output_syscall_timeline_pid(), output_syscall_cnt_pid(), output_syscall_rwsize_pid(), output_syscall_cnt_file(), output_syscall_rwsize_file())
+*
+*	last update : 2017. 05. 04 (Thur)
+*	create by Minsong Jeong (minseong482@gmail.com)
+*/
+
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+#define	MAX_FILE_NAME_LENGTH	1024
+#define MAX_SYSTEM_CALL_NAME_LENGTH	32
+#define MAX_SYSTEM_CALL_RETVAL	128
+#define MAX_FILE_OPEN	100
+#define SYSCALL_TYPE_SIZE	4	// open, read, write, close
+#define SYSCALL_TYPE_OTHERS	0
+#define SYSCALL_TYPE_OPEN	-1
+#define SYSCALL_TYPE_READ	-2
+#define SYSCALL_TYPE_WRITE	-3
+#define SYSCALL_TYPE_CLOSE	-4
+#define SYSCALL_TYPE_READ_OR_WRITE	-5
+#define TRUE	1
+#define FALSE	0
+#define STD_FD_0_INPUT	0
+#define STD_FD_1_OUTPUT	1
+#define STD_FD_2_ERROR	2
+#define OUTPUT_SYSCALL_FOOTPRINT_PID	-1
+#define OUTPUT_SYSCALL_CNT_PID	-2
+#define OUTPUT_SYSCALL_RWSIZE_PID	-3
+#define OUTPUT_SYSCALL_CNT_FILE	-4
+#define OUTPUT_SYSCALL_RWSIZE_FILE	-5
+
+
+/* system call unit */
+struct systemcall_unit {
+	char sn[MAX_SYSTEM_CALL_NAME_LENGTH];	// system call name
+	char *fn;	// file name
+
+	double at;	// access time
+
+	struct systemcall_unit *next;	// using data structure for management (current: double list)
+	struct systemcall_unit *prev;   // using data structure for management (current: double list)
+};
+
+/* statistics of system call */
+struct stat_systemcall {
+	char sn[MAX_SYSTEM_CALL_NAME_LENGTH];	// system call name
+	uint32_t cnt;	//	system call count
+
+	struct stat_systemcall *next;	// using data structure for management (current: double list)
+	struct stat_systemcall *prev;   // using data structure for management (current: double list)
+};
+
+/* file unit */
+struct file_unit {
+	char *fn;	// file name;
+
+	uint32_t acnt;	// access count (all of access cf. open, access, read, write etc..)
+	uint32_t rcnt;	// read system call count
+	uint32_t wcnt;	// write system call count
+	uint64_t rsize;	// amount of read
+	uint64_t wsize;	// amount of write
+
+	struct file_unit *next;	// using data structure for management (current: double list)
+	struct file_unit *prev; // using data structure for management (current: double list)
+};
+
+/* open file manager */
+struct open_file_manager {
+	int fd;	// file descriptor
+	struct file_unit *fu;
+};
+
+/* file_manager */
+struct access_file_information {
+	char fn[MAX_FILE_NAME_LENGTH];
+	uint32_t acnt;
+	uint32_t rcnt;
+	uint32_t wcnt;
+	uint64_t rsize;
+	uint64_t wsize;
+};
+
+/* process unit */
+struct process_unit {
+	uint32_t pid;	// process id
+	struct open_file_manager ofm[MAX_FILE_OPEN];
+
+	struct systemcall_unit *su;	// system calls
+	struct systemcall_unit *su_tail;	// system calls
+	struct stat_systemcall *ssc;	// statistics of system calls
+	struct file_unit *fu;	// access files
+
+	struct process_unit *next;	// using data structure for management (current: double list)
+	struct process_unit *prev;      // using data structure for management (current: double list)
+};
+
+/* process header */
+struct process_header {
+	struct process_unit *pu;	// process unit
+};
+
+/* unfinished line manager */
+struct unfinish_manager {
+	uint32_t pid;	// process id
+	char sn[MAX_SYSTEM_CALL_NAME_LENGTH];	// system call name
+	char fn[MAX_FILE_NAME_LENGTH];  // file name
+	int fd;	// file descriptor
+
+	struct unfinish_manager *next;
+	struct unfinish_manager *prev;
+};
+
+/* head of unfinish manager */
+struct head_unfinish_manager {
+	struct unfinish_manager *front;
+	struct unfinish_manager *tail;
+};
+
+/* initiate functions */
+int init_systemcall_unit (struct systemcall_unit **su);
+int init_stat_systemcall_unit (struct stat_systemcall **ssc);
+int init_file_unit (struct file_unit **fu);
+int init_process_unit (struct process_unit **pu);
+int init_process_header (struct process_header *ph, struct process_unit *pu);
+int init_unfinish_manager (struct unfinish_manager **um);
+int init_head_unfinish_manager (struct head_unfinish_manager *hum);
+int init_open_file_manager (struct open_file_manager *ofm, int size);
+
+/* set the value functions */
+int set_open_file_manager (struct open_file_manager *ofm, int fd, struct file_unit *fu);
+int set_access_file_information (struct process_header *ph);
+int set_close_file_manager (struct open_file_manager *ofm, int fd);
+
+/* malloc functions */
+void* malloc_unit (size_t size);
+
+/* memory free functions */
+int free_systemcall_unit (struct systemcall_unit *su, struct process_unit *pu);
+int free_stat_systemcall_unit (struct stat_systemcall *ssc, struct process_unit *pu);
+int free_file_unit (struct file_unit *fu, struct process_unit *pu);
+int free_process_unit (struct process_unit *pu, struct process_header *ph);
+int free_process_header (struct process_header *ph);
+int free_unfinish_manager (struct head_unfinish_manager *hum, struct unfinish_manager *um);
+
+/* strace analysis functions */
+int identy_systemcall_type (char *sn);
+int preprocess_strace (FILE *fpstrc, struct process_header *ph);
+struct process_unit * process_process_unit (struct process_header *ph, uint32_t pid);
+struct systemcall_unit * process_systemcall_unit (struct process_unit *pu, char *sn, char *fn, double clock);
+struct stat_systemcall * process_stat_systemcall_unit (struct process_header *ph, struct process_unit *pu, uint32_t pid, char *sn);
+struct file_unit * process_file_unit (struct process_header *ph, struct process_unit *pu, uint32_t pid, char *fn);
+struct process_unit * look_for_process_unit (struct process_header *ph, uint32_t pid);
+struct stat_systemcall * look_for_stat_systemcall_unit (struct process_header *ph, uint32_t pid, char *sn);
+struct file_unit * look_for_file_unit (struct process_header *ph, uint32_t pid, char *fn);
+struct unfinish_manager * look_for_unfinish_manager (struct head_unfinish_manager *hum, uint32_t pid, char *sn);
+
+/* for debugging functions */
+void print_all_process_unit (struct process_header *ph);
+void print_all_systemcall_unit (struct process_header *ph);
+void print_all_stat_systemcall_unit (struct process_header *ph);
+void print_all_file_unit (struct process_header *ph);
+void print_all_unfinish_manager (struct head_unfinish_manager *hum);
+
+/* output file functions */
+int output_syscall (struct process_header *ph, char *infn, int select);
+int output_syscall_timeline_pid (struct process_header *ph, char *res_path, char *infn);
+int output_syscall_cnt_pid (struct process_header *ph, char *res_path, char *infn);
+int output_syscall_rwsize_pid (struct process_header *ph, char *res_path, char *infn);
+int output_syscall_cnt_file (struct process_header *ph, char *res_path, char *infn);
+int output_syscall_rwsize_file (struct process_header *ph, char *res_path, char *infn);
+
+/* global variable */
+struct access_file_information afi[MAX_FILE_OPEN];
+int afi_size = 0;
+
+int main (int argc, char *argv[]) {
+	char strcfn[MAX_FILE_NAME_LENGTH];
+	FILE *fpstrc = NULL;
+	struct process_header ph;
+
+	if (argc < 2) {
+		printf (" input error : the number of input is too low\n");
+		printf (" Usage : [%s] [strace file name]\n", argv[0]);
+		return 1;
+	}
+
+	strcpy (strcfn, argv[1]);	// copy strace file name from argv[1]
+
+	fpstrc = fopen (strcfn, "r");
+
+	preprocess_strace (fpstrc, &ph);
+
+	/* print all */
+	//print_all_process_unit (&ph);
+	//print_all_systemcall_unit (&ph);
+	//print_all_stat_systemcall_unit (&ph);
+	//print_all_file_unit (&ph);
+
+	fclose (fpstrc);
+	set_access_file_information (&ph);
+	output_syscall (&ph, strcfn, OUTPUT_SYSCALL_FOOTPRINT_PID);
+	output_syscall (&ph, strcfn, OUTPUT_SYSCALL_CNT_PID);
+	output_syscall (&ph, strcfn, OUTPUT_SYSCALL_RWSIZE_PID);
+	output_syscall (&ph, strcfn, OUTPUT_SYSCALL_CNT_FILE);
+	output_syscall (&ph, strcfn, OUTPUT_SYSCALL_RWSIZE_FILE);
+
+	return 0;
+}
+
+int identy_systemcall_type (char *sn) {
+	int retval = SYSCALL_TYPE_OTHERS;
+
+	if (strcmp (sn, "open") == 0)
+		retval = SYSCALL_TYPE_OPEN;
+	else if (strcmp (sn, "close") == 0)
+		retval = SYSCALL_TYPE_CLOSE;
+	else if (strcmp (sn, "write") == 0)
+		retval = SYSCALL_TYPE_WRITE;
+	else if (strcmp (sn, "read") == 0)
+		retval = SYSCALL_TYPE_READ;
+
+	return retval;
+}
+
+int preprocess_strace (FILE *fpstrc, struct process_header *ph) {
+	int fd = 0, retval = 0, isresume = FALSE, isunfinish = FALSE;
+	double base_clock = 0.0, clock = 0.0;
+	uint32_t pid = 0;
+	char sn[MAX_SYSTEM_CALL_NAME_LENGTH], strcretval[MAX_SYSTEM_CALL_RETVAL], fn[(MAX_FILE_NAME_LENGTH)*2], *pfn = NULL, etc_sn[MAX_FILE_NAME_LENGTH], after_equal[MAX_SYSTEM_CALL_RETVAL];
+	uint64_t rsize = 0, wsize = 0; // amount of read, write
+	char sepresume, seppoint[6], sepunfinish[(MAX_FILE_NAME_LENGTH)*2];
+	struct process_unit *pu = NULL;
+	struct file_unit *fu = NULL;
+	struct stat_systemcall *ssc = NULL;
+	struct systemcall_unit *su = NULL;
+	struct unfinish_manager *um = NULL;
+	struct head_unfinish_manager hum = {NULL, NULL};
+
+	/* create and init headers */
+	init_process_unit (&pu);
+	init_process_header (ph, pu);
+	init_head_unfinish_manager (&hum);
+
+	/* read first line in strace file */
+	fscanf (fpstrc, "%d %lf %[^(] %[^=] %[^\n]\n", &pid, &clock, sn, fn, strcretval);
+	base_clock = clock;	// set base_clock
+	pu->pid = pid;
+
+	while (1) {
+		if (feof (fpstrc))
+			break;
+		
+		/* read file */
+		fscanf (fpstrc, "%d %lf ", &pid, &clock);
+		clock -= base_clock;
+		fscanf (fpstrc, "%c", &sepresume);
+		fseek (fpstrc, -1, SEEK_CUR);
+		
+		if (sepresume == '-' || sepresume == '+' || sepresume == '_') { // this line is SIGALRM, exit
+			fscanf (fpstrc, "%[^\n]\n", etc_sn);
+			continue;
+		}
+
+		if (sepresume == '<') {	// this line is resume
+			isresume = TRUE;
+
+			/* read file */
+			fscanf (fpstrc, "%s %s", seppoint, sn);
+			fscanf (fpstrc, "%[^\n]\n", sepunfinish);
+
+			if (identy_systemcall_type (sn) == SYSCALL_TYPE_OTHERS)	// not necessary value is skip
+				continue;
+
+			/* unfinished line */
+			if (sepunfinish[strlen(sepunfinish)-1] == '>') 
+				isunfinish = TRUE;
+			else {	// ordinary routine
+				isunfinish = FALSE;
+
+				fseek (fpstrc, -(strlen(sepunfinish)+1), SEEK_CUR);
+				fscanf (fpstrc, "%[^=] %[^\n]\n", fn, strcretval);
+			}
+		} else {	// systemcall
+			isresume = FALSE;
+
+			fscanf (fpstrc, "%[^(]", sn);
+			fscanf (fpstrc, "%[^\n]\n", sepunfinish);
+
+			if (identy_systemcall_type (sn) == SYSCALL_TYPE_OTHERS)	// not necessary value is skip
+				continue;
+
+			/* unfinished line */
+			if (sepunfinish[strlen(sepunfinish)-1] == '>') 
+				isunfinish = TRUE;
+			else {	// ordinary routine
+				isunfinish = FALSE;
+
+				fseek (fpstrc, -(strlen(sepunfinish)+1), SEEK_CUR);
+				fscanf (fpstrc, "%[^=] %[^\n]\n", fn, strcretval);		
+			}
+		}
+		/* read file (end) */
+
+		/* process unfinish line */
+		if (isunfinish == TRUE) {
+			/* add the node into unfinish list */			
+			init_unfinish_manager (&um);
+			um->pid = pid;
+			strcpy (um->sn, sn);
+			if (identy_systemcall_type (sn) == SYSCALL_TYPE_OPEN) {
+				strcpy (sepunfinish, sepunfinish+2);	// reposition path pos
+				pfn = strtok (sepunfinish, "\"");	// path identify
+				strcpy (um->fn, pfn);
+			} else if (identy_systemcall_type (sn) == SYSCALL_TYPE_READ || identy_systemcall_type (sn) == SYSCALL_TYPE_WRITE) { // the read or write line
+				strcpy (sepunfinish, sepunfinish+1);	// reposition fd pos
+				pfn = strtok (sepunfinish, ",");	// fd identify
+				um->fd = atoi (pfn);
+			} else if (identy_systemcall_type (sn) == SYSCALL_TYPE_CLOSE) {
+				strcpy (sepunfinish, sepunfinish+1);	// reposition fd pos
+				pfn = strtok (sepunfinish, " ");	// fd identify
+				um->fd = atoi (pfn);
+			}
+
+			if (hum.front == hum.tail) // unfinish list is empty 
+				hum.front->next = um;
+			else // unfinish list is not empty 
+				hum.tail->next = um;
+			
+			um->prev = hum.tail;
+			hum.tail = um;
+			continue;
+		}
+		
+		if (identy_systemcall_type (sn) == SYSCALL_TYPE_OTHERS)
+			continue;
+
+		/* skip open error line */
+		strcpy (after_equal, strcretval);
+		if (after_equal[2] == '-')
+			continue;
+		strcpy (after_equal, after_equal+2);
+
+		/* process resume */
+		if (isresume == TRUE) {
+			um = look_for_unfinish_manager (&hum, pid, sn);	// find unfinish unit by pid, sn
+
+			/* for debug*/
+			if (um == NULL) {
+				printf("clock:%lf, pid:%d, sn:%s, um == NULL\n", clock, pid, sn);
+				print_all_unfinish_manager (&hum);
+			}
+			strcpy (fn, um->fn);
+			pfn = fn;
+			fd = um->fd;
+			free_unfinish_manager (&hum, um);	// delete unfinish unit
+		} else if (identy_systemcall_type (sn) == SYSCALL_TYPE_OPEN) {
+			strcpy (fn, fn+2);
+			pfn = strtok (fn, "\"");
+			fd = atoi (after_equal);	// after_equal is fd
+		} else if (identy_systemcall_type (sn) == SYSCALL_TYPE_READ || identy_systemcall_type (sn) == SYSCALL_TYPE_WRITE) { // the read or write line
+			strcpy (fn, fn+1);
+			pfn = strtok (fn, ",");
+			fd = atoi (pfn);	// pfn is fd
+		} else if (identy_systemcall_type (sn) == SYSCALL_TYPE_CLOSE) {
+			strcpy (fn, fn+1);
+			pfn = strtok (fn, ")");
+			fd = atoi (pfn);	// pfn is fd
+		}
+				
+		/* set values of process_unit */
+		pu = process_process_unit (ph, pid);
+		/* set values of process_unit (end) */
+
+		/* set values of stat_systemcall */
+		ssc = process_stat_systemcall_unit (ph, pu, pid, sn);
+		/* set values of stat_systemcall (end) */
+
+		/* pre-process each system call */
+		if (identy_systemcall_type (sn) == SYSCALL_TYPE_OPEN) {
+
+			/* set values of systemcall_unit */
+			su = process_systemcall_unit (pu, sn, pfn, clock);
+			/* set values of systemcall_unit (end) */
+
+			/* set values of file_unit */
+			fu = process_file_unit (ph, pu, pid, pfn);
+			/* set values of file_unit (end) */
+
+			/* set open file manager */
+			fd = atoi (after_equal);
+			set_open_file_manager (pu->ofm, fd, fu);
+			/* set open file manager (end) */
+
+		} else if (identy_systemcall_type (sn) == SYSCALL_TYPE_CLOSE) {	// the close line
+
+			/* set values of systemcall_unit */
+			fu = pu->ofm[fd].fu;
+			if (fu != NULL) 
+				su = process_systemcall_unit (pu, sn, fu->fn, clock);
+			/* set values of systemcall_unit (end) */
+
+			/* set values of file_unit */
+			if (fu != NULL)
+				fu = process_file_unit (ph, pu, pid, fu->fn);
+			/* set values of file_unit (end) */
+
+			set_close_file_manager (pu->ofm, fd);	
+
+		} else if (identy_systemcall_type (sn) == SYSCALL_TYPE_READ || identy_systemcall_type (sn) == SYSCALL_TYPE_WRITE) { // the read or write line
+
+			/* set values of file_unit and open_file_manager */
+			if (pu->ofm[fd].fu == NULL) {
+				/* set values of file_unit */
+				init_file_unit (&fu);
+				fu->fn = (char *) malloc (sizeof (char) * (strlen ("existing file fd:")+5));
+				sprintf (fu->fn, "existing_file_fd:%d", fd);
+//				sprintf (fu->fn, "unknown");
+
+				if (pu->fu != NULL) {
+					fu->next = pu->fu;
+					pu->fu->prev = fu;
+				}
+				pu->fu = fu;
+
+				set_open_file_manager (pu->ofm, fd, fu);
+
+				pu->ofm[fd].fd = fd;
+				pu->ofm[fd].fu = fu;
+			}
+			/* set values of file_unit and open_file_manager (end) */
+				
+			fu = pu->ofm[fd].fu;
+
+			/* set values of systemcall_unit */
+			su = process_systemcall_unit (pu, sn, fu->fn, clock);
+			/* set values of systemcall_unit (end) */
+
+			if (identy_systemcall_type (sn) == SYSCALL_TYPE_READ) {	// read
+				fu->acnt++;
+				fu->rcnt++;
+				fu->rsize += atoi (after_equal);
+			} else if (identy_systemcall_type (sn) == SYSCALL_TYPE_WRITE) {	// write line
+				fu->acnt++;
+				fu->wcnt++;
+				fu->wsize += atoi (after_equal);
+			} else {	// error..
+				printf(" system call naming error\n");
+			}
+			
+		}
+		/* pre-process each system call (end) */
+
+	} // end of file read (while)
+
+	return retval;
+}
+
+/* process funtions */
+struct process_unit * process_process_unit (struct process_header *ph, uint32_t pid) {
+	struct process_unit *pu = NULL;
+
+	pu = look_for_process_unit (ph, pid);
+	if (pu == NULL) {
+		init_process_unit (&pu);
+		pu->pid = pid;
+		
+		if (ph->pu != NULL) {
+			pu->next = ph->pu;
+			ph->pu->prev = pu;
+		}
+		ph->pu = pu;
+	}
+	
+	return pu;
+}
+
+struct systemcall_unit * process_systemcall_unit (struct process_unit *pu, char *sn, char *fn, double clock) {
+	struct systemcall_unit *su = NULL;
+
+	init_systemcall_unit (&su);
+	strcpy (su->sn, sn);
+	su->fn = (char *) malloc (sizeof (char) * (strlen (fn)+1));
+	strcpy (su->fn, fn);
+	su->at = clock;
+
+	if (pu->su == NULL) 
+		pu->su_tail = su;
+	else {
+		su->next = pu->su;
+		pu->su->prev = su;
+	}
+	pu->su = su;
+
+	return su;
+}
+
+struct stat_systemcall * process_stat_systemcall_unit (struct process_header *ph, struct process_unit *pu, uint32_t pid, char *sn) {
+	struct stat_systemcall *ssc = NULL;
+
+	ssc = look_for_stat_systemcall_unit (ph, pid, sn);
+	if (ssc == NULL) {
+		init_stat_systemcall_unit (&ssc);
+		strcpy (ssc->sn, sn);
+	
+		if (pu->ssc != NULL) {
+			ssc->next = pu->ssc;
+			pu->ssc->prev = ssc;
+		}
+		pu->ssc = ssc;
+	}
+
+	ssc->cnt++;
+
+	return ssc;
+}
+
+struct file_unit * process_file_unit (struct process_header *ph, struct process_unit *pu, uint32_t pid, char *fn) {
+	struct file_unit *fu = NULL;
+
+	fu = look_for_file_unit (ph, pid, fn);
+	if (fu == NULL) {
+		init_file_unit (&fu);
+		fu->fn = (char *) malloc (sizeof (char) * (strlen (fn)+1));
+		strcpy (fu->fn, fn);
+	
+		if (pu->fu != NULL) {
+			fu->next = pu->fu;
+			pu->fu->prev = fu;
+		}
+		pu->fu = fu;
+	}
+
+	fu->acnt++;
+
+	return fu;
+}
+
+
+/* find process unit by pid */
+struct process_unit * look_for_process_unit (struct process_header *ph, uint32_t pid) {
+	struct process_unit *retval = ph->pu;
+	
+	while (retval != NULL) {
+		if (retval->pid == pid)
+			break;
+		retval = retval->next;
+	}
+
+	return retval;
+}
+
+/* find stat systemcall unit by pid, systemcall name */
+struct stat_systemcall * look_for_stat_systemcall_unit (struct process_header *ph, uint32_t pid, char *sn) {
+	struct process_unit *cur_pu = look_for_process_unit (ph, pid);
+	struct stat_systemcall *retval = cur_pu->ssc;
+
+	while (retval != NULL) {
+		if (strcmp (retval->sn, sn) == 0)
+			break;
+		retval = retval->next;
+	}
+
+	return retval;
+}
+
+/* find file unit by pid, file name */
+struct file_unit * look_for_file_unit (struct process_header *ph, uint32_t pid, char *fn) {
+	struct process_unit *cur_pu = look_for_process_unit (ph, pid);
+	struct file_unit *retval = cur_pu->fu;
+
+	while (retval != NULL) {
+		if (strcmp (retval->fn, fn) == 0)
+			break;
+		retval = retval->next;
+	}
+
+	return retval;
+}
+
+/* find unfinish unit by pid, systemcall name */
+struct unfinish_manager * look_for_unfinish_manager (struct head_unfinish_manager *hum, uint32_t pid, char *sn) {
+	struct unfinish_manager *retval = hum->front;
+
+	while (retval != NULL) {
+		if (retval->pid == pid && strcmp (retval->sn, sn) == 0)
+			break;
+		retval = retval->next;
+	}
+
+	return retval;
+}
+
+/* memory allocate and init systemcall unit values */
+int init_systemcall_unit (struct systemcall_unit **su) {
+	int retval = 0;
+	
+	/* init values */
+	*su = (struct systemcall_unit *) malloc_unit (sizeof(struct systemcall_unit));
+	if ((*su) == NULL) {
+		retval = 1;
+		return retval;
+	}
+
+	strcpy ((*su)->sn, "");
+	(*su)->fn = NULL;
+	(*su)->at = 0.0;
+	(*su)->prev = NULL;
+	(*su)->next = NULL;
+	
+	return retval;
+}
+
+/* memory allocate and init stat systemcall unit values */
+int init_stat_systemcall_unit (struct stat_systemcall **ssc) {
+	int retval = 0;
+	
+	/* init values */
+	*ssc = (struct stat_systemcall *) malloc_unit (sizeof(struct stat_systemcall));
+	if ((*ssc) == NULL) {
+		retval = 1;
+		return retval;
+	}
+
+	strcpy ((*ssc)->sn, "");
+	(*ssc)->cnt = 0;
+	(*ssc)->prev = NULL;
+	(*ssc)->next = NULL;
+	
+	return retval;
+}
+
+/* memory allocate and init file unit values */
+int init_file_unit (struct file_unit **fu) {
+	int retval = 0;
+	
+	/* init values */
+	*fu = (struct file_unit *) malloc_unit (sizeof(struct file_unit));
+	if ((*fu) == NULL) {
+		retval = 1;
+		return retval;
+	}
+
+	(*fu)->fn = NULL;
+	(*fu)->acnt = 0;
+	(*fu)->rcnt = 0;
+	(*fu)->wcnt = 0;
+	(*fu)->rsize = 0;
+	(*fu)->wsize = 0;
+	(*fu)->prev = NULL;
+	(*fu)->next = NULL;
+	
+	return retval;
+}
+
+/* memory allocate and init process unit values */
+int init_process_unit (struct process_unit **pu) {
+	int retval = 0, i = 0;
+	
+	/* init values */
+	*pu = (struct process_unit *) malloc_unit (sizeof(struct process_unit));
+	if ((*pu) == NULL) {
+		retval = 1;
+		return retval;
+	}
+
+	init_open_file_manager ((*pu)->ofm, MAX_FILE_OPEN);	
+
+	(*pu)->pid = 0;
+	(*pu)->su = NULL;
+	(*pu)->ssc = NULL;
+	(*pu)->fu = NULL;
+	(*pu)->next = NULL;
+	(*pu)->prev = NULL;
+
+	return retval;
+}
+
+/* init process header */
+int init_process_header (struct process_header *ph, struct process_unit *pu) {
+	int retval = 0;
+
+	ph->pu = pu;
+
+	return retval;
+}
+
+int init_unfinish_manager (struct unfinish_manager **um) {
+	int retval = 0;
+
+	/* init values */
+	*um = (struct unfinish_manager *) malloc_unit (sizeof(struct unfinish_manager));
+	if ((*um) == NULL) {
+		retval = 1;
+		return retval;
+	}
+
+	(*um)->pid = 0;
+	strcpy ((*um)->sn, "");
+	strcpy ((*um)->fn, "");
+	(*um)->fd = -1;
+	(*um)->next = NULL;
+	(*um)->prev = NULL;
+
+	return retval;
+}
+
+int init_head_unfinish_manager (struct head_unfinish_manager *hum) {
+	int retval = 0;
+	struct unfinish_manager *head_node = NULL;
+
+	init_unfinish_manager (&head_node);
+	strcpy (head_node->sn, "start_node");
+
+	hum->front = head_node;
+	hum->tail = head_node;
+
+	return retval;
+}
+
+int init_open_file_manager (struct open_file_manager *ofm, int size) {
+	int retval = 0, i = 0;
+
+	for (i = 0; i < size; i++) {
+		ofm[i].fd = -1;
+		ofm[i].fu = NULL;
+	}
+
+	return retval;
+}
+
+/* set values functions */
+int set_open_file_manager (struct open_file_manager *ofm, int fd, struct file_unit *fu) {
+	int retval = 0;
+	
+	ofm[fd].fd = fd;
+	ofm[fd].fu = fu;
+
+	return retval;
+}
+
+int set_access_file_information (struct process_header *ph) {
+	int retval = 0, i = 0;
+	struct process_unit *cur_pu = ph->pu;
+	struct file_unit *cur_fu = NULL;
+
+	while (cur_pu != NULL) {
+		cur_fu = cur_pu->fu;
+		while (cur_fu != NULL) {
+			for (i = 0; i < afi_size; i++) {
+				if (strcmp (afi[i].fn, cur_fu->fn) == 0) {
+					afi[i].acnt += cur_fu->acnt;
+					afi[i].rcnt += cur_fu->rcnt;
+					afi[i].wcnt += cur_fu->wcnt;
+					afi[i].rsize += cur_fu->rsize;
+					afi[i].wsize += cur_fu->wsize;
+					break;
+				}
+			}
+
+			if (i == afi_size) {
+				afi_size++;
+				strcpy (afi[i].fn, cur_fu->fn);
+				afi[i].acnt = cur_fu->acnt;
+				afi[i].rcnt = cur_fu->rcnt;
+				afi[i].wcnt = cur_fu->wcnt;
+				afi[i].rsize = cur_fu->rsize;
+				afi[i].wsize = cur_fu->wsize;
+			}
+
+			cur_fu = cur_fu->next;
+		}
+		cur_pu = cur_pu->next;
+	}
+	
+	return retval;
+}
+
+int set_close_file_manager (struct open_file_manager *ofm, int fd) {
+	int retval = 0;
+	
+	ofm[fd].fd = -1;
+	ofm[fd].fu = NULL;
+	
+	return retval;
+}
+
+/* malloc functions */
+void* malloc_unit (size_t size) {
+	void *retval = (void *) malloc (size);
+	return retval;
+}
+
+/* free functions */
+int free_systemcall_unit (struct systemcall_unit *su, struct process_unit *pu) {
+	int retval = 0;
+
+	/* init values */
+	strcpy (su->sn, "");
+	if (su->fn != NULL) {
+		su->fn = NULL;
+		free (su->fn);
+	}
+	su->at = 0.0;
+
+	if (su->prev != NULL && su->next != NULL) {
+		su->prev->next = su->next;
+		su->next->prev = su->prev;
+	}
+	else if (su->prev == NULL && su->next != NULL) {
+		pu->su = su->next;
+		su->next->prev = NULL;
+	}
+	else if (su->prev != NULL && su->next == NULL)
+		su->prev->next = NULL;
+	
+	su->prev = NULL;
+	su->next = NULL;
+
+	free (su);
+
+	return retval;
+}
+
+int free_stat_systemcall_unit (struct stat_systemcall *ssc, struct process_unit *pu) {
+	int retval = 0;
+
+	/* init values */
+	strcpy (ssc->sn, "");
+	ssc->cnt = 0;
+
+	if (ssc->prev != NULL && ssc->next != NULL) {
+		ssc->prev->next = ssc->next;
+		ssc->next->prev = ssc->prev;
+	}
+	else if (ssc->prev == NULL && ssc->next != NULL) {
+		pu->ssc = ssc->next;
+		ssc->next->prev = NULL;
+	}
+	else if (ssc->prev != NULL && ssc->next == NULL)
+		ssc->prev->next = NULL;
+	
+	ssc->prev = NULL;
+	ssc->next = NULL;
+
+	free (ssc);
+
+	return retval;
+}
+
+int free_file_unit (struct file_unit *fu, struct process_unit *pu) {
+	int retval = 0;
+
+	/* init values */
+	fu->fn = NULL;
+	free (fu->fn);
+	fu->acnt = 0;
+	fu->rcnt = 0;
+	fu->wcnt = 0;
+	fu->rsize = 0;
+	fu->wsize = 0;
+
+	if (fu->prev != NULL && fu->next != NULL) {
+		fu->prev->next = fu->next;
+		fu->next->prev = fu->prev;
+	}
+	else if (fu->prev == NULL && fu->next != NULL) {
+		pu->fu = fu->next;
+		fu->next->prev = NULL;
+	}
+	else if (fu->prev != NULL && fu->next == NULL)
+		fu->prev->next = NULL;
+	
+	fu->prev = NULL;
+	fu->next = NULL;
+
+	free (fu);
+
+	return retval;
+}
+
+int free_process_unit (struct process_unit *pu, struct process_header *ph) {
+	int retval = 0;
+	
+	pu->pid = 0;
+
+	if (pu->prev != NULL && pu->next != NULL) {
+		pu->prev->next = pu->next;
+		pu->next->prev = pu->prev;
+	}
+	else if (pu->prev == NULL && pu->next != NULL) {
+		ph->pu = pu->next;
+		pu->next->prev = NULL;
+	}
+	else if (pu->prev != NULL && pu->next == NULL)
+		pu->prev->next = NULL;
+	
+	pu->prev = NULL;
+	pu->next = NULL;
+
+	free (pu);
+
+	return retval;
+}
+
+int free_process_header (struct process_header *ph) {
+	int retval = 0;
+
+	while (ph->pu != NULL) {
+		while (ph->pu->su != NULL);
+			free_systemcall_unit (ph->pu->su, ph->pu);
+		while (ph->pu->ssc != NULL);
+			free_stat_systemcall_unit (ph->pu->ssc, ph->pu);
+		while (ph->pu->fu != NULL);
+			free_file_unit (ph->pu->fu, ph->pu);
+		free_process_unit (ph->pu, ph);
+	}
+
+	return retval;
+}
+
+int free_unfinish_manager (struct head_unfinish_manager *hum, struct unfinish_manager *um) {
+	int retval = 0;
+	
+	if (hum->tail == um)
+		hum->tail = um->prev;
+
+	um->prev->next = um->next;
+	if (um->next != NULL)
+		um->next->prev = um->prev;
+	um->prev = NULL;
+	um->next = NULL;
+	free (um);
+
+	return retval;
+}
+
+/* print functions (for checking and debugging) */
+void print_all_process_unit (struct process_header *ph) {
+	struct process_unit *cur_pu = ph->pu;
+	
+	printf ("\n ----- print all process unit -----\n");
+	while (cur_pu != NULL) {
+		printf ("pid : %d\n", cur_pu->pid);
+		cur_pu = cur_pu->next;
+	}
+	printf (" ----- print all process unit (end) -----\n");
+}
+
+void print_all_systemcall_unit (struct process_header *ph) {
+	struct process_unit *cur_pu = ph->pu;
+	struct systemcall_unit *cur_su = NULL;
+
+	printf ("\n ----- print all systemcall unit -----\n");
+	while (cur_pu != NULL) {
+		cur_su = cur_pu->su;
+		while (cur_su != NULL) {
+			printf ("process id : %d, systemcall name : %s, file name : %s, access time : %lf\n", cur_pu->pid, cur_su->sn, cur_su->fn, cur_su->at);
+			cur_su = cur_su->next;
+		}
+		cur_pu = cur_pu->next;
+	}
+	printf (" ----- print all systemcall unit (end) -----\n");
+}
+
+void print_all_stat_systemcall_unit (struct process_header *ph) {
+	struct process_unit *cur_pu = ph->pu;
+	struct stat_systemcall *cur_ssc = NULL;
+
+	printf ("\n ----- print all stat systemcall unit -----\n");
+	while (cur_pu != NULL) {
+		cur_ssc = cur_pu->ssc;
+		while (cur_ssc != NULL) {
+			printf ("process id : %d, systemcall name : %s, systemcall count : %d\n", cur_pu->pid, cur_ssc->sn, cur_ssc->cnt);
+			cur_ssc = cur_ssc->next;
+		}
+		cur_pu = cur_pu->next;
+	}
+	printf (" ----- print all stat systemcall unit (end) -----\n");
+}
+
+void print_all_file_unit (struct process_header *ph) {
+	struct process_unit *cur_pu = ph->pu;
+	struct file_unit *cur_fu = NULL;
+
+	printf ("\n ----- print all file unit -----\n");
+	while (cur_pu != NULL) {
+		cur_fu = cur_pu->fu;
+		while (cur_fu != NULL) {
+			printf ("\nprocess id : %d, file name : %s\n", cur_pu->pid, cur_fu->fn);
+			printf ("access count : %d\n", cur_fu->acnt);
+			printf ("read count : %d, write count : %d\n", cur_fu->rcnt, cur_fu->wcnt);
+			printf ("read size : %ld, write size : %ld\n", cur_fu->rsize, cur_fu->wsize);
+			cur_fu = cur_fu->next;
+		}
+		cur_pu = cur_pu->next;
+	}
+	printf (" ----- print all file unit (end) -----\n");
+}
+
+void print_all_unfinish_manager (struct head_unfinish_manager *hum) {
+	struct unfinish_manager *um = hum->front;
+	
+	while (um != NULL) {
+		printf (" \n pid: %d, sn: %s\n", um->pid, um->sn);
+		um = um->next;
+	}
+}
+
+/* output file functions */
+int output_syscall (struct process_header *ph, char *infn, int select) {
+	int retval = 0;
+	struct stat st = {0};
+	char res_dir[MAX_FILE_NAME_LENGTH], graph_dir[MAX_FILE_NAME_LENGTH];
+
+	if (stat ("result", &st) == -1)
+		mkdir ("result", 0777);
+
+	sprintf (res_dir, "result/%s", infn);
+	if (stat (res_dir, &st) == -1)
+		mkdir (res_dir, 0777);
+
+	sprintf (graph_dir, "%s/graphs", res_dir);
+	if (stat (graph_dir, &st) == -1)
+		mkdir (graph_dir, 0777);
+
+	switch (select) {
+		case OUTPUT_SYSCALL_FOOTPRINT_PID:
+			output_syscall_timeline_pid (ph, res_dir, infn);
+			break;
+		case OUTPUT_SYSCALL_CNT_PID:
+			output_syscall_cnt_pid (ph, res_dir, infn);
+			break;
+		case OUTPUT_SYSCALL_RWSIZE_PID:
+			output_syscall_rwsize_pid (ph, res_dir, infn);
+			break;
+		case OUTPUT_SYSCALL_CNT_FILE:
+			output_syscall_cnt_file (ph, res_dir, infn);
+			break;
+		case OUTPUT_SYSCALL_RWSIZE_FILE:
+			output_syscall_rwsize_file (ph, res_dir, infn);
+			break;
+		default:
+			break;
+	}
+
+	return retval;
+}
+
+int output_syscall_timeline_pid (struct process_header *ph, char *res_path, char *infn) {
+	int retval = 0;	
+	struct process_unit *cur_pu = ph->pu;
+	struct systemcall_unit *cur_su = NULL;
+	FILE *fp = NULL;
+	char outfn[MAX_FILE_NAME_LENGTH];
+
+	printf ("\n ----- start creating pid system call timeline file -----\n");
+	while (cur_pu != NULL) {
+		cur_su = cur_pu->su_tail;
+		sprintf (outfn, "%s/%s.timeline.pid#%d", res_path, infn, cur_pu->pid);
+		fp = fopen (outfn, "w");
+		if (fp == NULL) {
+			printf ("file open error!\n");
+			retval = 1;
+			return retval;
+		}
+		printf (" create %s file\n", outfn);
+		fprintf (fp, "#pid system call timeline\n");
+		fprintf (fp, "#clock systemcall_name\n");
+		while (cur_su != NULL) {
+			fprintf(fp, "%lf %s\n", cur_su->at, cur_su->sn);
+			cur_su = cur_su->prev;
+		}
+		fclose (fp);
+		printf (" create %s file (done - success) \n", outfn);
+		cur_pu = cur_pu->next;
+	}
+	printf (" ----- end creating pid system call timeline file -----\n");
+
+	return retval;
+}
+
+int output_syscall_cnt_pid (struct process_header *ph, char *res_path, char *infn) {
+	int retval = 0, i = 0;	
+	struct process_unit *cur_pu = ph->pu;
+	struct stat_systemcall *cur_ssc = NULL;
+	FILE *fp = NULL;
+	char outfn[MAX_FILE_NAME_LENGTH];
+
+	printf ("\n ----- start creating pid system call cnt file -----\n");
+	sprintf (outfn, "%s/%s.cnt.pid", res_path, infn);
+	fp = fopen (outfn, "w");
+	if (fp == NULL) {
+		printf ("file open error!\n");
+		retval = 1;
+		return retval;
+	}
+	printf (" create %s file\n", outfn);
+	fprintf (fp, "#pid system call cnt\n");
+	fprintf (fp, "#pid open read write close\n");
+
+	while (cur_pu != NULL) {
+		cur_ssc = cur_pu->ssc;
+		fprintf (fp, "%d ", cur_pu->pid);
+		for (i = 1; i <= SYSCALL_TYPE_SIZE; i++) {
+			cur_ssc = cur_pu->ssc;
+			while (cur_ssc != NULL) {
+				if (identy_systemcall_type (cur_ssc->sn) == -(i)) {
+					fprintf (fp, "%d", cur_ssc->cnt);
+					if (i != SYSCALL_TYPE_SIZE)
+						fprintf(fp, " ");
+					break;
+				}
+				cur_ssc = cur_ssc->next;
+			}
+			if (cur_ssc == NULL) {
+				fprintf (fp, "0");
+				if (i != SYSCALL_TYPE_SIZE)
+					fprintf(fp, " ");
+
+			}
+		}
+		fprintf (fp, "\n");
+		cur_pu = cur_pu->next;
+	}
+
+	fclose (fp);
+	printf (" create %s file (done - success) \n", outfn);
+	printf (" ----- end creating pid system call cnt file -----\n");
+
+	return retval;
+}
+
+int output_syscall_rwsize_pid (struct process_header *ph, char *res_path, char *infn) {
+	int retval = 0;
+	struct process_unit *cur_pu = ph->pu;
+	struct file_unit *cur_fu = NULL;
+	FILE *fp = NULL;
+	char outfn[MAX_FILE_NAME_LENGTH];
+	uint64_t rsize = 0, wsize = 0;
+
+	printf ("\n ----- start creating pid system call rwsize file -----\n");
+	sprintf (outfn, "%s/%s.rwsize.pid", res_path, infn);
+	fp = fopen (outfn, "w");
+	if (fp == NULL) {
+		printf ("file open error!\n");
+		retval = 1;
+		return retval;
+	}
+	printf (" create %s file\n", outfn);
+	fprintf (fp, "#pid amount of read and write\n");
+	fprintf (fp, "#pid read_size write_size\n");
+
+	while (cur_pu != NULL) {
+		cur_fu = cur_pu->fu;
+		while (cur_fu != NULL) {
+			rsize += cur_fu->rsize;
+			wsize += cur_fu->wsize;
+			cur_fu = cur_fu->next;
+		}
+		fprintf (fp, "%d %ld %ld\n", cur_pu->pid, rsize, wsize);
+		rsize = 0;
+		wsize = 0;
+		cur_pu = cur_pu->next;
+	}
+	fclose (fp);
+	printf (" create %s file (done - success) \n", outfn);
+	printf (" ----- end creating pid system call rwsize file -----\n");
+
+	return retval;
+}
+
+int output_syscall_cnt_file (struct process_header *ph, char *res_path, char *infn) {
+	int retval = 0, i = 0;
+	FILE *fp = NULL;
+	char outfn[MAX_FILE_NAME_LENGTH];
+
+	printf ("\n ----- start creating file name system call cnt file -----\n");
+	sprintf (outfn, "%s/%s.cnt.file", res_path, infn);
+	fp = fopen (outfn, "w");
+	if (fp == NULL) {
+		printf ("file open error!\n");
+		retval = 1;
+		return retval;
+	}
+	printf (" create %s file\n", outfn);
+	fprintf (fp, "#file name system call cnt\n");
+	fprintf (fp, "#file_name access read write\n");
+
+	for (i = 0; i < afi_size; i++)
+		fprintf (fp, "%s %d %d %d\n", afi[i].fn, afi[i].acnt, afi[i].rcnt, afi[i].wcnt);
+	
+	fclose (fp);
+	printf (" create %s file (done - success) \n", outfn);
+	printf (" ----- end creating file name system call cnt file -----\n");
+
+	return retval;
+}
+
+int output_syscall_rwsize_file (struct process_header *ph, char *res_path, char *infn) {
+	int retval = 0, i = 0;
+	FILE *fp = NULL;
+	char outfn[MAX_FILE_NAME_LENGTH];
+
+	printf ("\n ----- start creating file name system call rwsize file -----\n");
+	sprintf (outfn, "%s/%s.rwsize.file", res_path, infn);
+	fp = fopen (outfn, "w");
+	if (fp == NULL) {
+		printf ("file open error!\n");
+		retval = 1;
+		return retval;
+	}
+	printf (" create %s file\n", outfn);
+	fprintf (fp, "#file name amount of read and write\n");
+	fprintf (fp, "#file_name read_size write_size\n");
+
+	for (i = 0; i < afi_size; i++)
+		fprintf (fp, "%s %ld %ld\n", afi[i].fn, afi[i].rsize, afi[i].wsize);
+	
+	fclose (fp);
+	printf (" create %s file (done - success) \n", outfn);
+	printf (" ----- end creating file name system call rwsize file -----\n");
+
+	return retval;
+}
