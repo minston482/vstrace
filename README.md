@@ -11,7 +11,7 @@
 		  2017. 05. 04 - create output file function (output_syscall(), output_syscall_timeline_pid(), output_syscall_cnt_pid(), output_syscall_rwsize_pid(), output_syscall_cnt_file(), output_syscall_rwsize_file())
 *
 *	last update : 2017. 05. 04 (Thur)
-*	create by Minsong Jeong (https://github.com/minston482/vstrace, minseong482@gmail.com)
+*	create by Minsong Jeong (https://github.com/minston482/vtrace, minseong482@gmail.com)
 
 
 How to run ?
