@@ -2,8 +2,8 @@
 *	what is it? pre-process the strace's result to make the graphs.
 *	 
 *	history : 2017. 04. 26 - create data structure
-            2017. 04. 27 - create pre-processing function
-        		  2017. 04. 28 - create reading type of input file
+2017. 04. 27 - create pre-processing function
+2017. 04. 28 - create reading type of input file
         		  2017. 05. 01 - create open process in pre-processing function
         		  2017. 05. 02 - create close process in pre-processing function
         		  2017. 05. 03 - create read and write process in pre-processing function
