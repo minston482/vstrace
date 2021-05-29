@@ -1,3 +1,4 @@
+## History
 *	program name : strace viewer
 *	what is it? pre-process the strace's result to make the graphs.
 *
